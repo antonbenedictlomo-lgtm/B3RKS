@@ -35,9 +35,18 @@ const ACCESS_PASSWORD = "FIONA_911";
 // Key used to remember an unlocked session in this browser tab only.
 const AUTH_SESSION_KEY = "special-moments-unlocked";
 
-// Key used to persist the actual album data (crews, events, photos) so it
-// survives page refreshes and is shared across tabs/windows on this device.
-const ALBUM_STORAGE_KEY = "special-moments-album-data";
+// IndexedDB is used (instead of localStorage) to persist the actual album
+// data — crews, events, and photos — because its storage quota is vastly
+// larger (typically hundreds of MB to a few GB, vs. localStorage's ~5MB).
+// This matters a lot here since photos are stored as base64 text.
+const ALBUM_DB_NAME = "special-moments-db";
+const ALBUM_DB_VERSION = 1;
+const ALBUM_STORE_NAME = "album";
+const ALBUM_RECORD_KEY = "current";
+
+// Old key from an earlier version of this app that used localStorage.
+// Kept only so existing users' data gets migrated into IndexedDB once.
+const LEGACY_ALBUM_STORAGE_KEY = "special-moments-album-data";
 
 /* ============================================================
    Types
@@ -133,15 +142,60 @@ function createDefaultGroups(): Group[] {
   ];
 }
 
-function loadStoredGroups(): Group[] | null {
+function openAlbumDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined") {
+      reject(new Error("IndexedDB is not available in this environment."));
+      return;
+    }
+    const request = indexedDB.open(ALBUM_DB_NAME, ALBUM_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(ALBUM_STORE_NAME)) {
+        db.createObjectStore(ALBUM_STORE_NAME);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function loadGroupsFromDb(): Promise<Group[] | null> {
   try {
-    const raw = localStorage.getItem(ALBUM_STORAGE_KEY);
+    const db = await openAlbumDb();
+    return await new Promise<Group[] | null>((resolve, reject) => {
+      const tx = db.transaction(ALBUM_STORE_NAME, "readonly");
+      const req = tx.objectStore(ALBUM_STORE_NAME).get(ALBUM_RECORD_KEY);
+      req.onsuccess = () => {
+        const result = req.result;
+        resolve(Array.isArray(result) ? (result as Group[]) : null);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function saveGroupsToDb(groups: Group[]): Promise<void> {
+  const db = await openAlbumDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(ALBUM_STORE_NAME, "readwrite");
+    tx.objectStore(ALBUM_STORE_NAME).put(groups, ALBUM_RECORD_KEY);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// One-time migration: if an older version of this app left data behind in
+// localStorage, pull it into IndexedDB so nobody loses their album.
+function loadLegacyGroupsFromLocalStorage(): Group[] | null {
+  try {
+    const raw = localStorage.getItem(LEGACY_ALBUM_STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return null;
-    return parsed as Group[];
+    return Array.isArray(parsed) && parsed.length > 0 ? (parsed as Group[]) : null;
   } catch {
-    // Corrupted or inaccessible storage — fall back to the defaults.
     return null;
   }
 }
@@ -811,9 +865,8 @@ const App: React.FC = () => {
     }
   }
 
-  const [groups, setGroups] = useState<Group[]>(
-    () => loadStoredGroups() ?? BUILT_IN_ALBUM_DATA ?? createDefaultGroups()
-  );
+  const [groups, setGroups] = useState<Group[]>(() => BUILT_IN_ALBUM_DATA ?? createDefaultGroups());
+  const [isAlbumLoaded, setIsAlbumLoaded] = useState(false);
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
   const [activeEventId, setActiveEventId] = useState<string | null>(null);
   const [dialog, setDialog] = useState<DialogState>({ type: "none" });
@@ -846,45 +899,71 @@ const App: React.FC = () => {
   const activeGroup = groups.find((g) => g.id === activeGroupId) ?? null;
   const activeEvent = activeGroup?.events.find((e) => e.id === activeEventId) ?? null;
 
-  /* ---------- Persistence: local cache only (no cloud) ---------- */
+  /* ---------- Persistence: load from IndexedDB (much higher quota) ---------- */
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
-  const isFirstRender = useRef(true);
 
-  // Whenever the album changes, cache it locally so it survives refreshes.
   useEffect(() => {
-    if (isFirstRender.current) {
-      isFirstRender.current = false;
-      return;
-    }
+    let cancelled = false;
+    (async () => {
+      const stored = await loadGroupsFromDb();
+      if (cancelled) return;
 
-    try {
-      localStorage.setItem(ALBUM_STORAGE_KEY, JSON.stringify(groups));
-      setStorageWarning(null);
-    } catch {
-      // Most likely the browser's storage quota was exceeded — this can
-      // happen once a lot of full-size photos have been added, since they
-      // are stored as base64 text. Data already saved stays put; only the
-      // newest change failed to persist.
-      setStorageWarning(
-        "Couldn't save your latest change — storage is full. Try removing a few photos."
-      );
-    }
-  }, [groups]);
-
-  /* ---------- Persistence: stay in sync across tabs on THIS device ---------- */
-  useEffect(() => {
-    function handleStorageEvent(e: StorageEvent) {
-      if (e.key !== ALBUM_STORAGE_KEY || e.newValue === null) return;
-      try {
-        const parsed = JSON.parse(e.newValue);
-        if (Array.isArray(parsed)) setGroups(parsed as Group[]);
-      } catch {
-        /* ignore malformed data written by another tab */
+      if (stored && stored.length > 0) {
+        setGroups(stored);
+      } else {
+        // Nothing in IndexedDB yet — check for data left over from an
+        // earlier version of this app that used localStorage, and bring
+        // it forward so nobody loses their album on the upgrade.
+        const legacy = loadLegacyGroupsFromLocalStorage();
+        if (legacy) {
+          setGroups(legacy);
+          try {
+            localStorage.removeItem(LEGACY_ALBUM_STORAGE_KEY);
+          } catch {
+            /* not critical if this fails */
+          }
+        }
       }
-    }
-    window.addEventListener("storage", handleStorageEvent);
-    return () => window.removeEventListener("storage", handleStorageEvent);
+      setIsAlbumLoaded(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  /* ---------- Persistence: stay in sync across tabs/windows on THIS device ---------- */
+  const albumChannelRef = useRef<BroadcastChannel | null>(null);
+
+  useEffect(() => {
+    if (typeof BroadcastChannel === "undefined") return;
+    const channel = new BroadcastChannel("special-moments-album-sync");
+    albumChannelRef.current = channel;
+    channel.onmessage = (e) => {
+      if (Array.isArray(e.data)) setGroups(e.data as Group[]);
+    };
+    return () => {
+      channel.close();
+      albumChannelRef.current = null;
+    };
+  }, []);
+
+  // Whenever the album changes (after the initial load has completed),
+  // save it to IndexedDB so it survives refreshes.
+  useEffect(() => {
+    if (!isAlbumLoaded) return;
+    saveGroupsToDb(groups)
+      .then(() => {
+        setStorageWarning(null);
+        albumChannelRef.current?.postMessage(groups);
+      })
+      .catch(() => {
+        // IndexedDB's quota is much larger than localStorage's, so this
+        // should be rare — but the device could still be genuinely full.
+        setStorageWarning(
+          "Couldn't save your latest change — device storage may be full. Try removing a few photos."
+        );
+      });
+  }, [groups, isAlbumLoaded]);
 
   /* ---------- Navigation ---------- */
   function openGroup(groupId: string) {
