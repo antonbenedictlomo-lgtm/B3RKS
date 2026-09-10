@@ -39,10 +39,23 @@ const AUTH_SESSION_KEY = "special-moments-unlocked";
 // data — crews, events, and photos — because its storage quota is vastly
 // larger (typically hundreds of MB to a few GB, vs. localStorage's ~5MB).
 // This matters a lot here since photos are stored as base64 text.
+//
+// Two object stores are used rather than one:
+//   - ALBUM_STORE_NAME holds a single lightweight "skeleton" record: crew
+//     names, event titles/dates, and photo ids — but NOT the base64 image
+//     data itself. This stays small no matter how many photos you have, so
+//     saving it (which happens on every edit) is always fast.
+//   - PHOTO_STORE_NAME holds one record per photo, keyed by photo id, with
+//     the base64 image data as the value. Photos are written/deleted
+//     individually as you add/remove them, instead of rewriting the entire
+//     album every time. This is what makes storing a gigabyte-plus of
+//     photos practical: a single edit no longer means re-serializing and
+//     re-writing the whole library.
 const ALBUM_DB_NAME = "special-moments-db";
-const ALBUM_DB_VERSION = 1;
+const ALBUM_DB_VERSION = 2;
 const ALBUM_STORE_NAME = "album";
 const ALBUM_RECORD_KEY = "current";
+const PHOTO_STORE_NAME = "photos";
 
 // Old key from an earlier version of this app that used localStorage.
 // Kept only so existing users' data gets migrated into IndexedDB once.
@@ -154,13 +167,42 @@ function openAlbumDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(ALBUM_STORE_NAME)) {
         db.createObjectStore(ALBUM_STORE_NAME);
       }
+      if (!db.objectStoreNames.contains(PHOTO_STORE_NAME)) {
+        db.createObjectStore(PHOTO_STORE_NAME);
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
 }
 
-async function loadGroupsFromDb(): Promise<Group[] | null> {
+// Strips base64 image data out of a Group tree, leaving just the
+// structure (ids, names, titles, dates). This is what actually gets
+// written to ALBUM_STORE_NAME — it stays tiny regardless of how many or
+// how large the photos are, so every edit saves near-instantly.
+function stripPhotoUrls(groups: Group[]): Group[] {
+  return groups.map((g) => ({
+    ...g,
+    events: g.events.map((e) => ({
+      ...e,
+      photos: e.photos.map((p) => ({ id: p.id, url: null })),
+    })),
+  }));
+}
+
+// Re-attaches base64 image data (loaded separately from PHOTO_STORE_NAME)
+// onto a skeleton Group tree, by matching photo id.
+function mergePhotoUrls(groups: Group[], photoMap: Map<string, string>): Group[] {
+  return groups.map((g) => ({
+    ...g,
+    events: g.events.map((e) => ({
+      ...e,
+      photos: e.photos.map((p) => ({ ...p, url: photoMap.get(p.id) ?? p.url ?? null })),
+    })),
+  }));
+}
+
+async function loadSkeletonFromDb(): Promise<Group[] | null> {
   try {
     const db = await openAlbumDb();
     return await new Promise<Group[] | null>((resolve, reject) => {
@@ -177,14 +219,104 @@ async function loadGroupsFromDb(): Promise<Group[] | null> {
   }
 }
 
-async function saveGroupsToDb(groups: Group[]): Promise<void> {
+async function saveSkeletonToDb(groups: Group[]): Promise<void> {
   const db = await openAlbumDb();
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(ALBUM_STORE_NAME, "readwrite");
-    tx.objectStore(ALBUM_STORE_NAME).put(groups, ALBUM_RECORD_KEY);
+    tx.objectStore(ALBUM_STORE_NAME).put(stripPhotoUrls(groups), ALBUM_RECORD_KEY);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
+}
+
+// Loads every stored photo's base64 data in one pass, keyed by photo id.
+// Using a cursor (rather than one get() per photo) keeps this to a single
+// transaction no matter how many photos there are.
+async function loadAllPhotoBlobs(): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  try {
+    const db = await openAlbumDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(PHOTO_STORE_NAME, "readonly");
+      const store = tx.objectStore(PHOTO_STORE_NAME);
+      const req = store.openCursor();
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (cursor) {
+          if (typeof cursor.value === "string") {
+            map.set(String(cursor.key), cursor.value);
+          }
+          cursor.continue();
+        } else {
+          resolve();
+        }
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    /* fall through with whatever was collected (possibly empty) */
+  }
+  return map;
+}
+
+async function savePhotoBlob(id: string, url: string): Promise<void> {
+  const db = await openAlbumDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(PHOTO_STORE_NAME, "readwrite");
+    tx.objectStore(PHOTO_STORE_NAME).put(url, id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function deletePhotoBlob(id: string): Promise<void> {
+  const db = await openAlbumDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(PHOTO_STORE_NAME, "readwrite");
+    tx.objectStore(PHOTO_STORE_NAME).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function deletePhotoBlobs(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const db = await openAlbumDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(PHOTO_STORE_NAME, "readwrite");
+    const store = tx.objectStore(PHOTO_STORE_NAME);
+    ids.forEach((id) => store.delete(id));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// Collects every photo id + inline url still embedded in a Group tree.
+// Used to migrate data saved by the old (pre-v2) single-blob format, where
+// base64 image data lived directly inside the skeleton.
+function collectInlinePhotos(groups: Group[]): { id: string; url: string }[] {
+  const found: { id: string; url: string }[] = [];
+  for (const g of groups) {
+    for (const e of g.events) {
+      for (const p of e.photos) {
+        if (p.url) found.push({ id: p.id, url: p.url });
+      }
+    }
+  }
+  return found;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const decimals = unitIndex === 0 ? 0 : 1;
+  return `${value.toFixed(decimals)} ${units[unitIndex]}`;
 }
 
 // One-time migration: if an older version of this app left data behind in
@@ -364,6 +496,35 @@ const styles = `
   color: var(--gold-light);
   font-size: 13px;
   font-weight: 700;
+}
+
+.storage-usage {
+  margin-bottom: 18px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.storage-usage-bar {
+  flex: 1;
+  min-width: 80px;
+  max-width: 220px;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(253,240,208,0.15);
+  overflow: hidden;
+}
+
+.storage-usage-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--gold), var(--gold-light));
+}
+
+.storage-usage-label {
+  font-size: 12px;
+  color: rgba(253,240,208,0.6);
+  white-space: nowrap;
 }
 
 .section-header h2 {
@@ -707,6 +868,43 @@ const styles = `
 }
 .add-slot:hover { border-color: var(--gold); color: var(--gold); }
 
+/* Lightbox: full-size photo view */
+.lightbox-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(4,8,16,0.92);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  cursor: zoom-out;
+  animation: fadeIn 0.15s ease;
+}
+
+.lightbox-image {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 10px;
+  box-shadow: 0 24px 70px rgba(0,0,0,0.6);
+  cursor: default;
+}
+
+.lightbox-close {
+  position: fixed;
+  top: 18px;
+  right: 22px;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 1px solid rgba(253,240,208,0.3);
+  background: rgba(12,26,46,0.7);
+  color: var(--parchment);
+  font-size: 16px;
+  cursor: pointer;
+}
+.lightbox-close:hover { background: rgba(12,26,46,0.9); border-color: var(--gold-light); }
+
 /* Dialogs */
 .modal.dialog h3 { font-family: 'Cinzel', serif; font-size: 19px; margin: 0 0 16px; color: var(--navy); }
 .modal.dialog p { font-size: 13px; color: #5a4c33; margin: 0 0 18px; }
@@ -870,6 +1068,7 @@ const App: React.FC = () => {
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
   const [activeEventId, setActiveEventId] = useState<string | null>(null);
   const [dialog, setDialog] = useState<DialogState>({ type: "none" });
+  const [viewingPhotoUrl, setViewingPhotoUrl] = useState<string | null>(null);
 
   const [inputName, setInputName] = useState("");
   const [eventTitleInput, setEventTitleInput] = useState("");
@@ -892,6 +1091,15 @@ const App: React.FC = () => {
     return () => clearTimeout(t);
   }, [importMessage]);
 
+  useEffect(() => {
+    if (!viewingPhotoUrl) return;
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") setViewingPhotoUrl(null);
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [viewingPhotoUrl]);
+
   const today = new Date();
   const isBirthday = today.getMonth() === 8 && today.getDate() === 11; // September 11
   const heroTitle = isBirthday ? "It's Your Birthday." : "Special Moments";
@@ -901,21 +1109,57 @@ const App: React.FC = () => {
 
   /* ---------- Persistence: load from IndexedDB (much higher quota) ---------- */
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
+  const [storageUsage, setStorageUsage] = useState<{ usage: number; quota: number } | null>(null);
+
+  const refreshStorageUsage = React.useCallback(async () => {
+    try {
+      if (navigator.storage && navigator.storage.estimate) {
+        const { usage, quota } = await navigator.storage.estimate();
+        if (typeof usage === "number" && typeof quota === "number") {
+          setStorageUsage({ usage, quota });
+        }
+      }
+    } catch {
+      /* estimate() isn't supported everywhere — fine to skip */
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const stored = await loadGroupsFromDb();
+      // Ask the browser not to evict this data under storage pressure.
+      // (Best-effort — not every browser grants it, and Safari in
+      // particular may ignore or auto-deny this without a user gesture.)
+      try {
+        await navigator.storage?.persist?.();
+      } catch {
+        /* not critical if unsupported */
+      }
+
+      const skeleton = await loadSkeletonFromDb();
+      const photoMap = await loadAllPhotoBlobs();
       if (cancelled) return;
 
-      if (stored && stored.length > 0) {
-        setGroups(stored);
+      if (skeleton && skeleton.length > 0) {
+        // Migrate any photos still inlined from the old (pre-v2) format:
+        // write them into the photo store, then they'll be picked up by
+        // mergePhotoUrls below and stripped out of future skeleton saves.
+        const inline = collectInlinePhotos(skeleton).filter((p) => !photoMap.has(p.id));
+        if (inline.length > 0) {
+          await Promise.all(inline.map((p) => savePhotoBlob(p.id, p.url)));
+          inline.forEach((p) => photoMap.set(p.id, p.url));
+        }
+        setGroups(mergePhotoUrls(skeleton, photoMap));
       } else {
         // Nothing in IndexedDB yet — check for data left over from an
         // earlier version of this app that used localStorage, and bring
         // it forward so nobody loses their album on the upgrade.
         const legacy = loadLegacyGroupsFromLocalStorage();
         if (legacy) {
+          const inline = collectInlinePhotos(legacy);
+          if (inline.length > 0) {
+            await Promise.all(inline.map((p) => savePhotoBlob(p.id, p.url)));
+          }
           setGroups(legacy);
           try {
             localStorage.removeItem(LEGACY_ALBUM_STORAGE_KEY);
@@ -925,11 +1169,12 @@ const App: React.FC = () => {
         }
       }
       setIsAlbumLoaded(true);
+      refreshStorageUsage();
     })();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [refreshStorageUsage]);
 
   /* ---------- Persistence: stay in sync across tabs/windows on THIS device ---------- */
   const albumChannelRef = useRef<BroadcastChannel | null>(null);
@@ -948,13 +1193,18 @@ const App: React.FC = () => {
   }, []);
 
   // Whenever the album changes (after the initial load has completed),
-  // save it to IndexedDB so it survives refreshes.
+  // save its skeleton (structure only — no image data) to IndexedDB so it
+  // survives refreshes. This is cheap regardless of photo library size:
+  // the actual base64 image data is written separately, per-photo, at the
+  // moment each photo is added or removed (see handleFileChange /
+  // removePhoto / submitDeleteEvent / submitDeleteGroup below).
   useEffect(() => {
     if (!isAlbumLoaded) return;
-    saveGroupsToDb(groups)
+    saveSkeletonToDb(groups)
       .then(() => {
         setStorageWarning(null);
         albumChannelRef.current?.postMessage(groups);
+        refreshStorageUsage();
       })
       .catch(() => {
         // IndexedDB's quota is much larger than localStorage's, so this
@@ -963,7 +1213,7 @@ const App: React.FC = () => {
           "Couldn't save your latest change — device storage may be full. Try removing a few photos."
         );
       });
-  }, [groups, isAlbumLoaded]);
+  }, [groups, isAlbumLoaded, refreshStorageUsage]);
 
   /* ---------- Navigation ---------- */
   function openGroup(groupId: string) {
@@ -1027,6 +1277,14 @@ const App: React.FC = () => {
   function submitDeleteGroup() {
     if (dialog.type !== "confirmDeleteGroup") return;
     const { groupId } = dialog;
+    const group = groups.find((g) => g.id === groupId);
+    if (group) {
+      const photoIds = group.events.flatMap((e) => e.photos.filter((p) => p.url).map((p) => p.id));
+      deletePhotoBlobs(photoIds).catch(() => {
+        /* skeleton save covers structural consistency; a leftover orphan
+           blob just wastes a little space, it won't resurface in the UI */
+      });
+    }
     setGroups((prev) => prev.filter((g) => g.id !== groupId));
     if (activeGroupId === groupId) {
       setActiveGroupId(null);
@@ -1080,6 +1338,14 @@ const App: React.FC = () => {
   function submitDeleteEvent() {
     if (dialog.type !== "confirmDeleteEvent") return;
     const { groupId, eventId } = dialog;
+    const group = groups.find((g) => g.id === groupId);
+    const event = group?.events.find((e) => e.id === eventId);
+    if (event) {
+      const photoIds = event.photos.filter((p) => p.url).map((p) => p.id);
+      deletePhotoBlobs(photoIds).catch(() => {
+        /* see note in submitDeleteGroup */
+      });
+    }
     setGroups((prev) =>
       prev.map((g) =>
         g.id === groupId ? { ...g, events: g.events.filter((e) => e.id !== eventId) } : g
@@ -1125,6 +1391,19 @@ const App: React.FC = () => {
         const url = typeof reader.result === "string" ? reader.result : null;
         if (!url) return;
         const { groupId, eventId, slotId } = target;
+
+        // Write the image data straight to the photo store, keyed by its
+        // own id — not as part of the big skeleton save. If this fails
+        // (e.g. device storage is full), surface a warning instead of
+        // silently losing the photo.
+        savePhotoBlob(slotId, url)
+          .then(() => setStorageWarning(null))
+          .catch(() => {
+            setStorageWarning(
+              "Couldn't save that photo — device storage may be full. Try removing a few photos."
+            );
+          });
+
         setGroups((prev) =>
           prev.map((g) =>
             g.id === groupId
@@ -1151,6 +1430,9 @@ const App: React.FC = () => {
   }
 
   function removePhoto(groupId: string, eventId: string, slotId: string) {
+    deletePhotoBlob(slotId).catch(() => {
+      /* see note in submitDeleteGroup */
+    });
     setGroups((prev) =>
       prev.map((g) =>
         g.id === groupId
@@ -1194,7 +1476,18 @@ const App: React.FC = () => {
         const text = typeof reader.result === "string" ? reader.result : "";
         const parsed = JSON.parse(text);
         if (!Array.isArray(parsed)) throw new Error("Not an album array");
-        setGroups(parsed as Group[]);
+        const imported = parsed as Group[];
+
+        // Export files carry photo data inline (as base64). Write each one
+        // into the photo store so future edits only need to save the
+        // lightweight skeleton, same as photos added directly in-app.
+        const inline = collectInlinePhotos(imported);
+        Promise.all(inline.map((p) => savePhotoBlob(p.id, p.url))).catch(() => {
+          /* individual photo writes are best-effort; the in-memory state
+             below still has the full data either way */
+        });
+
+        setGroups(imported);
         setImportMessage({ type: "success", text: "Album imported!" });
       } catch {
         setImportMessage({
@@ -1271,6 +1564,21 @@ const App: React.FC = () => {
       {/* Crew grid */}
       <main className="content">
         {storageWarning && <div className="storage-warning">⚠ {storageWarning}</div>}
+        {storageUsage && storageUsage.quota > 0 && (
+          <div className="storage-usage">
+            <div className="storage-usage-bar">
+              <div
+                className="storage-usage-fill"
+                style={{
+                  width: `${Math.min(100, (storageUsage.usage / storageUsage.quota) * 100)}%`,
+                }}
+              />
+            </div>
+            <span className="storage-usage-label">
+              {formatBytes(storageUsage.usage)} used of {formatBytes(storageUsage.quota)} available
+            </span>
+          </div>
+        )}
         {importMessage && (
           <div className={importMessage.type === "success" ? "import-success" : "storage-warning"}>
             {importMessage.type === "success" ? "✓" : "⚠"} {importMessage.text}
@@ -1433,7 +1741,9 @@ const App: React.FC = () => {
                   key={photo.id}
                   className="photo-slot"
                   onClick={() =>
-                    !photo.url && triggerUpload(activeGroup.id, activeEvent.id, photo.id)
+                    photo.url
+                      ? setViewingPhotoUrl(photo.url)
+                      : triggerUpload(activeGroup.id, activeEvent.id, photo.id)
                   }
                 >
                   {photo.url ? (
@@ -1467,6 +1777,26 @@ const App: React.FC = () => {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Lightbox: full-size view of a single photo */}
+      {viewingPhotoUrl && (
+        <div className="lightbox-backdrop" onClick={() => setViewingPhotoUrl(null)}>
+          <button
+            type="button"
+            className="lightbox-close"
+            onClick={() => setViewingPhotoUrl(null)}
+            aria-label="Close photo"
+          >
+            ✕
+          </button>
+          <img
+            className="lightbox-image"
+            src={viewingPhotoUrl}
+            alt=""
+            onClick={(e) => e.stopPropagation()}
+          />
         </div>
       )}
 
