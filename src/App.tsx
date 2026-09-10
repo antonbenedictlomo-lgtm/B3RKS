@@ -1,6 +1,29 @@
 import React, { useRef, useState, useEffect, ChangeEvent, FormEvent } from "react";
 
 /* ============================================================
+   Built-in starting album (no cloud — bake your photos into
+   the file you send someone)
+   ============================================================
+   Workflow:
+   1. Open this app yourself and build out your crews, events,
+      and photos as normal.
+   2. Click the "⬇ Export Album" button in the app — it downloads
+      a JSON file with everything in it.
+   3. Open that JSON file, copy its ENTIRE contents, and paste it
+      in place of `null` below (so it reads
+      `const BUILT_IN_ALBUM_DATA: Group[] | null = [ ...your data... ];`).
+   4. Save this file and send/deploy it. Anyone who opens it in a
+      fresh browser (no prior data saved) will see your album
+      already loaded — nothing uploaded anywhere, it's just part
+      of the code itself.
+
+   Once someone opens the link, their own edits are saved only in
+   THEIR browser (via localStorage) and won't sync back to you —
+   this is the no-cloud, no-server tradeoff.
+   ============================================================ */
+const BUILT_IN_ALBUM_DATA: Group[] | null = null;
+
+/* ============================================================
    Access control
    ============================================================
    Set your own password below. Anyone who wants to open this
@@ -258,6 +281,24 @@ const styles = `
   flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 24px;
+}
+
+.section-header-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.import-success {
+  margin-bottom: 18px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  border: 1px solid rgba(46,139,87,0.5);
+  background: rgba(46,139,87,0.15);
+  color: #8fe0b3;
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .storage-warning {
@@ -770,7 +811,9 @@ const App: React.FC = () => {
     }
   }
 
-  const [groups, setGroups] = useState<Group[]>(() => loadStoredGroups() ?? createDefaultGroups());
+  const [groups, setGroups] = useState<Group[]>(
+    () => loadStoredGroups() ?? BUILT_IN_ALBUM_DATA ?? createDefaultGroups()
+  );
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
   const [activeEventId, setActiveEventId] = useState<string | null>(null);
   const [dialog, setDialog] = useState<DialogState>({ type: "none" });
@@ -785,6 +828,16 @@ const App: React.FC = () => {
     slotId: string;
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
+  const [importMessage, setImportMessage] = useState<{ type: "success" | "error"; text: string } | null>(
+    null
+  );
+
+  useEffect(() => {
+    if (!importMessage) return;
+    const t = setTimeout(() => setImportMessage(null), 4000);
+    return () => clearTimeout(t);
+  }, [importMessage]);
 
   const today = new Date();
   const isBirthday = today.getMonth() === 8 && today.getDate() === 11; // September 11
@@ -793,17 +846,17 @@ const App: React.FC = () => {
   const activeGroup = groups.find((g) => g.id === activeGroupId) ?? null;
   const activeEvent = activeGroup?.events.find((e) => e.id === activeEventId) ?? null;
 
-  /* ---------- Persistence: save on every change ---------- */
+  /* ---------- Persistence: local cache only (no cloud) ---------- */
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
   const isFirstRender = useRef(true);
 
+  // Whenever the album changes, cache it locally so it survives refreshes.
   useEffect(() => {
-    // Skip the very first run so we don't immediately re-write the exact
-    // data we just loaded.
     if (isFirstRender.current) {
       isFirstRender.current = false;
       return;
     }
+
     try {
       localStorage.setItem(ALBUM_STORAGE_KEY, JSON.stringify(groups));
       setStorageWarning(null);
@@ -818,7 +871,7 @@ const App: React.FC = () => {
     }
   }, [groups]);
 
-  /* ---------- Persistence: stay in sync across tabs/windows ---------- */
+  /* ---------- Persistence: stay in sync across tabs on THIS device ---------- */
   useEffect(() => {
     function handleStorageEvent(e: StorageEvent) {
       if (e.key !== ALBUM_STORAGE_KEY || e.newValue === null) return;
@@ -1035,6 +1088,45 @@ const App: React.FC = () => {
     );
   }
 
+  /* ---------- Export / Import (no-cloud sharing) ---------- */
+  function exportAlbum() {
+    const dataStr = JSON.stringify(groups, null, 2);
+    const blob = new Blob([dataStr], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "special-moments-album.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function triggerImport() {
+    importInputRef.current?.click();
+  }
+
+  function handleImportFileChange(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const text = typeof reader.result === "string" ? reader.result : "";
+        const parsed = JSON.parse(text);
+        if (!Array.isArray(parsed)) throw new Error("Not an album array");
+        setGroups(parsed as Group[]);
+        setImportMessage({ type: "success", text: "Album imported!" });
+      } catch {
+        setImportMessage({
+          type: "error",
+          text: "That file doesn't look like a valid album export.",
+        });
+      }
+    };
+    reader.readAsText(file);
+  }
+
   /* ============================================================
      Render
      ============================================================ */
@@ -1100,13 +1192,39 @@ const App: React.FC = () => {
       {/* Crew grid */}
       <main className="content">
         {storageWarning && <div className="storage-warning">⚠ {storageWarning}</div>}
+        {importMessage && (
+          <div className={importMessage.type === "success" ? "import-success" : "storage-warning"}>
+            {importMessage.type === "success" ? "✓" : "⚠"} {importMessage.text}
+          </div>
+        )}
 
         <div className="section-header">
           <h2>Your Crews</h2>
-          <button type="button" className="btn btn-gold" onClick={() => openDialog({ type: "newGroup" })}>
-            + New Crew
-          </button>
+          <div className="section-header-actions">
+            <button type="button" className="btn btn-ghost" onClick={exportAlbum} title="Download this album as a file">
+              ⬇ Export Album
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={triggerImport}
+              title="Load an album file exported earlier"
+            >
+              ⬆ Import Album
+            </button>
+            <button type="button" className="btn btn-gold" onClick={() => openDialog({ type: "newGroup" })}>
+              + New Crew
+            </button>
+          </div>
         </div>
+
+        <input
+          ref={importInputRef}
+          type="file"
+          accept="application/json,.json"
+          style={{ display: "none" }}
+          onChange={handleImportFileChange}
+        />
 
         <div className="groups-grid">
           {groups.map((group) => (
