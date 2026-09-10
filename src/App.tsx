@@ -7,7 +7,7 @@ import React, { useRef, useState, useEffect, ChangeEvent, FormEvent } from "reac
    album must know this exact value — it lives only in this
    file, so only you (the developer) control it.
    ============================================================ */
-const ACCESS_PASSWORD = "BlackPearl1826";
+const ACCESS_PASSWORD = "FIONA_911";
 
 // Key used to remember an unlocked session in this browser tab only.
 const AUTH_SESSION_KEY = "special-moments-unlocked";
@@ -1025,7 +1025,7 @@ const App: React.FC = () => {
         <div className="date-pill">{formatBadgeDate(today)}</div>
         <h1 className="hero-title">{heroTitle}</h1>
         <p className="hero-subtitle">
-          I made this for you to keep your special moments with your family and friends 😊.
+          Your memories deserve a place to live forever.
         </p>
       </header>
 
