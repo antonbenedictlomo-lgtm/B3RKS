@@ -12,6 +12,10 @@ const ACCESS_PASSWORD = "FIONA_911";
 // Key used to remember an unlocked session in this browser tab only.
 const AUTH_SESSION_KEY = "special-moments-unlocked";
 
+// Key used to persist the actual album data (crews, events, photos) so it
+// survives page refreshes and is shared across tabs/windows on this device.
+const ALBUM_STORAGE_KEY = "special-moments-album-data";
+
 /* ============================================================
    Types
    ============================================================ */
@@ -104,6 +108,19 @@ function createDefaultGroups(): Group[] {
       events: [],
     },
   ];
+}
+
+function loadStoredGroups(): Group[] | null {
+  try {
+    const raw = localStorage.getItem(ALBUM_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return parsed as Group[];
+  } catch {
+    // Corrupted or inaccessible storage — fall back to the defaults.
+    return null;
+  }
 }
 
 function formatBadgeDate(date: Date): string {
@@ -241,6 +258,17 @@ const styles = `
   flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 24px;
+}
+
+.storage-warning {
+  margin-bottom: 18px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  border: 1px solid rgba(240,168,50,0.5);
+  background: rgba(200,150,10,0.12);
+  color: var(--gold-light);
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .section-header h2 {
@@ -742,7 +770,7 @@ const App: React.FC = () => {
     }
   }
 
-  const [groups, setGroups] = useState<Group[]>(() => createDefaultGroups());
+  const [groups, setGroups] = useState<Group[]>(() => loadStoredGroups() ?? createDefaultGroups());
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
   const [activeEventId, setActiveEventId] = useState<string | null>(null);
   const [dialog, setDialog] = useState<DialogState>({ type: "none" });
@@ -764,6 +792,46 @@ const App: React.FC = () => {
 
   const activeGroup = groups.find((g) => g.id === activeGroupId) ?? null;
   const activeEvent = activeGroup?.events.find((e) => e.id === activeEventId) ?? null;
+
+  /* ---------- Persistence: save on every change ---------- */
+  const [storageWarning, setStorageWarning] = useState<string | null>(null);
+  const isFirstRender = useRef(true);
+
+  useEffect(() => {
+    // Skip the very first run so we don't immediately re-write the exact
+    // data we just loaded.
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    try {
+      localStorage.setItem(ALBUM_STORAGE_KEY, JSON.stringify(groups));
+      setStorageWarning(null);
+    } catch {
+      // Most likely the browser's storage quota was exceeded — this can
+      // happen once a lot of full-size photos have been added, since they
+      // are stored as base64 text. Data already saved stays put; only the
+      // newest change failed to persist.
+      setStorageWarning(
+        "Couldn't save your latest change — storage is full. Try removing a few photos."
+      );
+    }
+  }, [groups]);
+
+  /* ---------- Persistence: stay in sync across tabs/windows ---------- */
+  useEffect(() => {
+    function handleStorageEvent(e: StorageEvent) {
+      if (e.key !== ALBUM_STORAGE_KEY || e.newValue === null) return;
+      try {
+        const parsed = JSON.parse(e.newValue);
+        if (Array.isArray(parsed)) setGroups(parsed as Group[]);
+      } catch {
+        /* ignore malformed data written by another tab */
+      }
+    }
+    window.addEventListener("storage", handleStorageEvent);
+    return () => window.removeEventListener("storage", handleStorageEvent);
+  }, []);
 
   /* ---------- Navigation ---------- */
   function openGroup(groupId: string) {
@@ -1031,6 +1099,8 @@ const App: React.FC = () => {
 
       {/* Crew grid */}
       <main className="content">
+        {storageWarning && <div className="storage-warning">⚠ {storageWarning}</div>}
+
         <div className="section-header">
           <h2>Your Crews</h2>
           <button type="button" className="btn btn-gold" onClick={() => openDialog({ type: "newGroup" })}>
